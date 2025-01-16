@@ -16,6 +16,35 @@ from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from src.heuristics import RA
 from src.utils import ROOT_DIR, get_src_dst_degree, get_pos_neg_edges, get_same_source_negs
 from src.hashing import ElphHashes
+from torch_scatter import scatter
+
+
+def wl_node_coloring(data, max_iters=10):
+    # Calculate node degrees
+    edge_index = data.edge_label_index[:,data.edge_label==1]
+    num_nodes = data.num_nodes
+    node_degrees = scatter(torch.ones_like(edge_index[0]), edge_index[1], dim=0, dim_size=num_nodes, reduce='sum')
+    
+    # Initialize colors with node degrees
+    node_colors = node_degrees.clone()
+
+    for _ in range(max_iters):
+        # Aggregate colors of neighbors
+        aggregated_colors = scatter(node_colors[edge_index[0]], edge_index[1], dim_size=num_nodes, reduce='mean')
+        
+        # Concatenate current colors with aggregated neighbor colors
+        new_colors = torch.stack([node_colors, aggregated_colors], dim=-1)
+        
+        # Apply a simple hash function: generate unique integers from concatenated values
+        new_colors = torch.sum(new_colors * torch.tensor([1000, 1], device=data.x.device), dim=-1)
+        
+        # Check for convergence
+        if torch.equal(node_colors, new_colors):
+            break
+        node_colors = new_colors
+    return node_colors
+
+
 
 
 class HashDataset(Dataset):
@@ -26,13 +55,13 @@ class HashDataset(Dataset):
 
     def __init__(
             self, root, split, data, pos_edges, neg_edges, args, use_coalesce=False,
-            directed=False, **kwargs):
+            directed=False, all_mark1=None,all_mark1_label=None,**kwargs):
         if args.model != 'ELPH':  # elph stores the hashes directly in the model class for message passing
             self.elph_hashes = ElphHashes(args)  # object for hash and subgraph feature operations
         self.split = split  # string: train, valid or test
         self.root = root
-        self.pos_edges = pos_edges
-        self.neg_edges = neg_edges
+        self.pos_edges = pos_edges[0]
+        self.neg_edges = neg_edges[0]
         self.use_coalesce = use_coalesce
         self.directed = directed
         self.args = args
@@ -50,6 +79,9 @@ class HashDataset(Dataset):
 
         self.links = torch.cat([self.pos_edges, self.neg_edges], 0)  # [n_edges, 2]
         self.labels = [1] * self.pos_edges.size(0) + [0] * self.neg_edges.size(0)
+        self.marks = torch.cat([pos_edges[1],neg_edges[1]])
+        self.all_mark1 = all_mark1 if all_mark1 is not None else None
+        self.all_mark1_label = all_mark1_label if all_mark1_label is not None else None
 
         if self.use_coalesce:  # compress multi-edge into edge with weight
             data.edge_index, data.edge_weight = coalesce(
@@ -75,9 +107,9 @@ class HashDataset(Dataset):
 
         if self.use_RA:
             self.RA = RA(self.A, self.links, batch_size=2000000)[0]
-
-        if args.model == 'ELPH':  # features propagated in the model instead of preprocessed
-            self.x = data.x
+        cand = ['ELPH', 'GCN', 'SAGE', 'GIN', 'JKNet']
+        if args.model in cand:  # features propagated in the model instead of preprocessed
+            self.x = data.x if args.dataset_name != 'ogbl-ddi' else self.degrees.reshape(data.num_nodes, -1)
         else:
             self.x = self._preprocess_node_features(data, self.edge_index, self.edge_weight, args.sign_k)
             # ELPH does hashing and feature prop on the fly
@@ -239,23 +271,30 @@ class HashDataset(Dataset):
             RA = -1
         src_degree, dst_degree = get_src_dst_degree(src, dst, self.A, None)
         node_features = torch.cat([self.x[src].unsqueeze(dim=0), self.x[dst].unsqueeze(dim=0)], dim=0)
-        return subgraph_features, node_features, src_degree, dst_degree, RA, y
+        return subgraph_features, node_features, src_degree, dst_degree, RA, y, self.marks[idx]
 
 
 def get_hashed_train_val_test_datasets(dataset, train_data, val_data, test_data, args, directed=False):
     root = f'{dataset.root}/elph_'
     print(f'data path: {root}')
     use_coalesce = True if args.dataset_name == 'ogbl-collab' else False
-    pos_train_edge, neg_train_edge = get_pos_neg_edges(train_data)
-    pos_val_edge, neg_val_edge = get_pos_neg_edges(val_data)
-    pos_test_edge, neg_test_edge = get_pos_neg_edges(test_data)
+    colors = wl_node_coloring(train_data)
+    pos_train_edge, neg_train_edge = get_pos_neg_edges(train_data, color=colors)
+    pos_val_edge, neg_val_edge = get_pos_neg_edges(val_data, color=colors)
+    pos_test_edge, neg_test_edge = get_pos_neg_edges(test_data, color=colors)
+    edges = train_data['edge_label_index'].to(train_data['edge_index'].device)
+    labels = train_data['edge_label'].to(train_data['edge_index'].device)
+    all_mark1 = edges[:,train_data['edge_marks']==1].t()
+    all_mark1_label = labels[train_data['edge_marks']==1]
+    #todo:here the {split}_data has been updated in the get_pos_neg_edge function
     print(
-        f'before sampling, considering a superset of {pos_train_edge.shape[0]} pos, {neg_train_edge.shape[0]} neg train edges '
-        f'{pos_val_edge.shape[0]} pos, {neg_val_edge.shape[0]} neg val edges '
-        f'and {pos_test_edge.shape[0]} pos, {neg_test_edge.shape[0]} neg test edges for supervision')
+        f'before sampling, considering a superset of {pos_train_edge[0].shape[0]} pos, {neg_train_edge[0].shape[0]} neg train edges '
+        f'{pos_val_edge[0].shape[0]} pos, {neg_val_edge[0].shape[0]} neg val edges '
+        f'and {pos_test_edge[0].shape[0]} pos, {neg_test_edge[0].shape[0]} neg test edges for supervision')
     print('constructing training dataset object')
+    
     train_dataset = HashDataset(root, 'train', train_data, pos_train_edge, neg_train_edge, args,
-                                use_coalesce=use_coalesce, directed=directed)
+                                use_coalesce=use_coalesce, directed=directed,all_mark1 = all_mark1,all_mark1_label=all_mark1_label)
     print('constructing validation dataset object')
     val_dataset = HashDataset(root, 'valid', val_data, pos_val_edge, neg_val_edge, args,
                               use_coalesce=use_coalesce, directed=directed)

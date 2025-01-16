@@ -17,7 +17,7 @@ from torch_geometric.datasets import Planetoid
 from torch_geometric.transforms import RandomLinkSplit
 from torch_geometric.utils import (add_self_loops, negative_sampling,
                                    to_undirected)
-from torch_geometric.utils.negative_sampling import vector_to_edge_index, edge_index_to_vector, sample
+from torch_geometric.utils._negative_sampling import vector_to_edge_index, edge_index_to_vector, sample
 from torch_geometric.utils.num_nodes import maybe_num_nodes
 from torch_geometric.loader import DataLoader as pygDataLoader
 import wandb
@@ -30,7 +30,7 @@ from src.datasets.elph import get_hashed_train_val_test_datasets, make_train_eva
 
 def get_loaders(args, dataset, splits, directed):
     train_data, val_data, test_data = splits['train'], splits['valid'], splits['test']
-    if args.model in {'ELPH', 'BUDDY'}:
+    if args.model in {'ELPH', 'BUDDY', 'GCN', 'SAGE'}:
         train_dataset, val_dataset, test_dataset = get_hashed_train_val_test_datasets(dataset, train_data, val_data,
                                                                                       test_data, args, directed)
     else:
@@ -41,7 +41,7 @@ def get_loaders(args, dataset, splits, directed):
         if args.wandb:
             wandb.log({"seal_preprocessing_time": time.time() - t0})
 
-    dl = DataLoader if args.model in {'ELPH', 'BUDDY'} else pygDataLoader
+    dl = DataLoader if args.model in {'ELPH', 'BUDDY', 'GCN', 'SAGE'} else pygDataLoader
     train_loader = dl(train_dataset, batch_size=args.batch_size,
                       shuffle=True, num_workers=args.num_workers)
     # as the val and test edges are often sampled they also need to be shuffled
@@ -52,7 +52,7 @@ def get_loaders(args, dataset, splits, directed):
     shuffle_test = False if args.dataset_name.startswith('ogbl-citation') else True
     test_loader = dl(test_dataset, batch_size=args.batch_size, shuffle=shuffle_test,
                      num_workers=args.num_workers)
-    if (args.dataset_name == 'ogbl-citation2') and (args.model in {'ELPH', 'BUDDY'}):
+    if (args.dataset_name == 'ogbl-citation2') and (args.model in {'ELPH', 'BUDDY', 'GCN'}):
         train_eval_loader = dl(
             make_train_eval_data(args, train_dataset, train_data.num_nodes,
                                   n_pos_samples=5000), batch_size=args.batch_size, shuffle=False,
@@ -112,7 +112,8 @@ def get_data(args):
         splits = get_ogb_data(data, split_edge, dataset_name, args.num_negs)
     else:  # make random splits
         transform = RandomLinkSplit(is_undirected=undirected, num_val=val_pct, num_test=test_pct,
-                                    add_negative_train_samples=include_negatives)
+                                    add_negative_train_samples=include_negatives, neg_sampling_ratio=args.num_negs)
+        
         train_data, val_data, test_data = transform(dataset.data)
         splits = {'train': train_data, 'valid': val_data, 'test': test_data}
 

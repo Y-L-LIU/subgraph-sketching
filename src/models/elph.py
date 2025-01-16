@@ -8,15 +8,80 @@ import logging
 import torch
 import torch.nn.functional as F
 from torch.nn import Linear
+import torch.types
 from torch_geometric.nn import GCNConv
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.utils import add_self_loops
-
+from torch import nn
 from src.models.gnn import SIGN, SIGNEmbedding
 from src.hashing import ElphHashes
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARN)
+
+
+
+class Decoder(nn.Module):
+    def __init__(self, dim_z, dim_sf, cuda,use_feature=False, use_embedding=False):
+        super(Decoder, self).__init__()
+        dim_in = dim_z
+        self.mlp_sf = nn.Sequential(
+            nn.Linear(dim_sf, dim_sf, bias=True),
+            nn.BatchNorm1d(dim_sf),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+        )
+        self.mlp_feature = nn.Sequential(
+            nn.Linear(dim_in, dim_in, bias=True),
+            nn.BatchNorm1d(dim_in),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+        )
+        self.mlp_embed = nn.Sequential(
+            nn.Linear(dim_in, dim_in, bias=True),
+            nn.BatchNorm1d(dim_in),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+        )
+        concat_dim = dim_sf
+        if use_embedding:
+            concat_dim+=dim_in
+        if use_feature:
+            concat_dim +=dim_in
+        self.use_embedding, self.use_feature = use_embedding, use_feature
+        self.out_1 = nn.Sequential(nn.Linear(concat_dim, 1, bias=False), nn.Sigmoid())
+        self.out_0 = nn.Sequential(nn.Linear(concat_dim, 1, bias=False), nn.Sigmoid())
+        self.lin = Linear(concat_dim, 1)
+
+
+    def forward(self, subgraph_features, z, batch_emb, T):
+        # z is the subgraph feature
+        h0 = self.mlp_sf(subgraph_features)
+        if self.use_feature:
+            z = z[:, 0, :] * z[:, 1, :]
+            z = self.mlp_feature(z)
+            h0 = torch.concat([h0,z], dim=1)
+        if self.use_embedding:
+            emb = batch_emb[:, 0, :] * batch_emb[:, 1, :]
+            emb = self.mlp_embed(emb)
+            h0 = torch.concat([h0,emb], dim=1)
+        h_1 = self.out_1(h0).squeeze()  # (N,)
+        h_0 = self.out_0(h0).squeeze()
+        t1 = T.squeeze().float()
+        res_f = torch.zeros_like(t1).to(T.device)
+        # return self.lin(h0)
+        res_f[t1 == 0] = h_0[t1 == 0]
+        res_f[t1 == 1] = h_1[t1 == 1]
+        h = res_f
+        return h
+
+    def reset_parameters(self):
+        for lin in self.mlp_out:
+            try:
+                lin.reset_parameters()
+            except:
+                continue
+
 
 
 class LinkPredictor(torch.nn.Module):
@@ -79,7 +144,7 @@ class LinkPredictor(torch.nn.Module):
         if self.use_feature:
             node_features = self.feature_forward(node_features)
             x = torch.cat([x, node_features.to(torch.float)], 1)
-        if emb is not None:
+        if self.use_embedding:
             node_embedding = self.embedding_forward(emb)
             x = torch.cat([x, node_embedding.to(torch.float)], 1)
         x = self.lin(x)
@@ -122,7 +187,11 @@ class ELPH(torch.nn.Module):
         self._convolution_builder(num_features, args.hidden_channels,
                                   args)  # build the convolutions for features and embs
         # construct the edgewise NN components
-        self.predictor = LinkPredictor(args, node_embedding is not None)
+        if args.dblp:
+            self.predictor = Decoder(args.hidden_channels, args.max_hash_hops * (args.max_hash_hops + 2),
+                                     'cuda:0',use_feature=args.use_feature, use_embedding=node_embedding is not None)
+        else:
+            self.predictor = LinkPredictor(args, node_embedding is not None)
         if self.sign_k != 0 and self.propagate_embeddings:
             # only used for the ddi where nodes have no features and transductive node embeddings are needed
             self.sign_embedding = SIGNEmbedding(args.hidden_channels, args.hidden_channels, args.hidden_channels,
@@ -204,7 +273,6 @@ class ELPH(torch.nn.Module):
                 node_hashings_table[k]['hll'] = self.init_hll
                 if self.feature_prop in {'residual', 'cat'}:  # need to get features to the hidden dim
                     x = self._encode_features(x)
-
             else:
                 node_hashings_table[k]['hll'] = self.elph_hashes.hll_prop(node_hashings_table[k - 1]['hll'],
                                                                           hash_edge_index)
@@ -212,7 +280,6 @@ class ELPH(torch.nn.Module):
                                                                                   hash_edge_index)
                 cards[:, k - 1] = self.elph_hashes.hll_count(node_hashings_table[k]['hll'])
                 x = self.feature_conv(x, edge_index, k)
-
             logger.info(f'{k} hop hash generation ran in {time() - start} s')
 
         return x, node_hashings_table, cards

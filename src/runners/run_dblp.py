@@ -7,7 +7,7 @@ import warnings
 from math import inf
 import sys
 import random
-import torch.optim as optim
+
 sys.path.insert(0, '..')
 
 import numpy as np
@@ -23,7 +23,6 @@ from scipy.sparse import SparseEfficiencyWarning
 warnings.filterwarnings("ignore", category=SparseEfficiencyWarning)
 
 from src.data import get_data, get_loaders
-from src.models.gnn import GCN, SAGE, SIGN
 from src.models.elph import ELPH, BUDDY
 from src.models.seal import SEALDGCNN, SEALGCN, SEALGIN, SEALSAGE
 from src.utils import ROOT_DIR, print_model_params, select_embedding, str2bool
@@ -50,7 +49,7 @@ def set_seed(seed):
 
 def run(args):
     args = initialise_wandb(args)
-    device = torch.device(f'cuda:{args.device}' if args.device>=0 else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"executing on {device}")
     results_list = []
     train_func = get_train_func(args)
@@ -63,7 +62,6 @@ def run(args):
         else:
             evaluator = Evaluator(name='ogbl-ppa')  # this sets HR@100 as the metric
         emb = select_embedding(args, dataset.data.num_nodes, device)
-        print(emb)
         model, optimizer = select_model(args, dataset, emb, device)
         val_res = test_res = best_epoch = 0
         print(f'running repetition {rep}')
@@ -71,10 +69,9 @@ def run(args):
             print_model_params(model)
         for epoch in range(args.epochs):
             t0 = time.time()
-            loss = train_func(model, optimizer[0], train_loader, args, device,emb)
-            optimizer[1].step()
+            loss = train_func(model, optimizer, train_loader, args, device)
             if (epoch + 1) % args.eval_steps == 0:
-                results = test(model, evaluator, train_eval_loader, val_loader, test_loader, args, device,emb=emb,
+                results = test(model, evaluator, train_eval_loader, val_loader, test_loader, args, device,
                                eval_metric=eval_metric)
                 for key, result in results.items():
                     train_res, tmp_val_res, tmp_test_res = result
@@ -132,10 +129,6 @@ def select_model(args, dataset, emb, device):
         model = BUDDY(args, dataset.num_features, node_embedding=emb).to(device)
     elif args.model == 'ELPH':
         model = ELPH(args, dataset.num_features, node_embedding=emb).to(device)
-    elif args.model == 'GCN':
-        model = GCN(args,emb.weight.size(1),3).to(device)
-    elif args.model == 'SAGE':
-        model = SAGE(args,emb.weight.size(1),3).to(device)
     else:
         raise NotImplementedError
     parameters = list(model.parameters())
@@ -143,12 +136,11 @@ def select_model(args, dataset, emb, device):
         torch.nn.init.xavier_uniform_(emb.weight)
         parameters += list(emb.parameters())
     optimizer = torch.optim.Adam(params=parameters, lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
     total_params = sum(p.numel() for param in parameters for p in param)
     print(f'Total number of parameters is {total_params}')
     if args.model == 'DGCNN':
         print(f'SortPooling k is set to {model.k}')
-    return model, (optimizer, scheduler)
+    return model, optimizer
 
 
 if __name__ == '__main__':
@@ -208,7 +200,7 @@ if __name__ == '__main__':
                         help="whether to consider edge weight in GNN")
     # Training settings
     parser.add_argument('--lr', type=float, default=0.0001)
-    parser.add_argument('--weight_decay', type=float, default=0.0002, help='Weight decay for optimization')
+    parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay for optimization')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--num_negs', type=int, default=1, help='number of negatives for each positive')
@@ -256,8 +248,8 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_watch_grad', action='store_true', help='allows gradient tracking in train function')
     parser.add_argument('--wandb_track_grad_flow', action='store_true')
 
-    parser.add_argument('--wandb_entity', default="hanya", type=str)
-    parser.add_argument('--wandb_project', default="dblp", type=str)
+    parser.add_argument('--wandb_entity', default="link-prediction", type=str)
+    parser.add_argument('--wandb_project', default="link-prediction", type=str)
     parser.add_argument('--wandb_group', default="testing", type=str, help="testing,tuning,eval")
     parser.add_argument('--wandb_run_name', default=None, type=str)
     parser.add_argument('--wandb_output_dir', default='./wandb_output',
@@ -267,8 +259,6 @@ if __name__ == '__main__':
                         help='list of epochs to log gradient flow')
     parser.add_argument('--log_features', action='store_true', help="log feature importance")
     parser.add_argument('--dblp', action='store_true', help="enable dblp")
-    parser.add_argument('--l1', type=float,default=0.05, help="enable l1")
-    parser.add_argument('--device', type=int,default=0, help="gpu to use")
 
     args = parser.parse_args()
     if (args.max_hash_hops == 1) and (not args.use_zero_one):

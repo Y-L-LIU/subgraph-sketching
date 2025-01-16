@@ -10,7 +10,7 @@ from torch.nn import BCEWithLogitsLoss
 from tqdm import tqdm
 import wandb
 import numpy as np
-
+import random
 from src.utils import get_num_samples
 
 
@@ -33,12 +33,13 @@ def train_buddy(model, optimizer, train_loader, args, device, emb=None):
     # hydrate edges
     links = data.links
     labels = torch.tensor(data.labels)
+    marks = torch.tensor(data.marks)
     # sampling
     train_samples = get_num_samples(args.train_samples, len(labels))
     sample_indices = torch.randperm(len(labels))[:train_samples]
     links = links[sample_indices]
     labels = labels[sample_indices]
-
+    marks = marks[sample_indices]
     if args.wandb:
         wandb.log({"train_total_batches": len(train_loader)})
     batch_processing_times = []
@@ -69,6 +70,7 @@ def train_buddy(model, optimizer, train_loader, args, device, emb=None):
             RA = None
         start_time = time.time()
         optimizer.zero_grad()
+        curr_marks = marks[indices]
         logits = model(subgraph_features, node_features, degrees[:, 0], degrees[:, 1], RA, batch_emb)
         loss = get_loss(args.loss)(logits, labels[indices].squeeze(0).to(device))
 
@@ -113,7 +115,23 @@ def train(model, optimizer, train_loader, args, device, emb=None):
     if args.wandb:
         wandb.log({"train_total_batches": len(train_loader)})
     batch_processing_times = []
-    for batch_count, data in enumerate(pbar):
+    data = train_loader.dataset
+    # print(data.x.shape)
+    links = data.links
+    marks = data.marks
+    mark1 = data.all_mark1.to(device)
+    mark1_label = data.all_mark1_label.to(device)
+    labels = torch.tensor(data.labels)
+    # sampling
+    if args.dynamic_train:
+        train_samples = get_num_samples(args.train_samples, len(labels))
+        sample_indices = torch.randperm(len(labels))[:train_samples]
+        links = links[sample_indices]
+        labels = labels[sample_indices]
+        marks = data.marks[sample_indices]
+
+    loader = DataLoader(range(len(links)), args.batch_size, shuffle=True)
+    for batch_count, indices in enumerate(tqdm(loader)):
         start_time = time.time()
         optimizer.zero_grad()
         # todo this loop should no longer be hit as this function isn't called for BUDDY
@@ -121,7 +139,7 @@ def train(model, optimizer, train_loader, args, device, emb=None):
             data_dev = [elem.squeeze().to(device) for elem in data]
             logits = model(*data_dev[:-1])  # everything but the labels
             loss = get_loss(args.loss)(logits, data[-1].squeeze(0).to(device))
-        else:
+        elif 'SEAL' in args.model:
             data = data.to(device)
             x = data.x if args.use_feature else None
             edge_weight = data.edge_weight if args.use_edge_weight else None
@@ -129,20 +147,47 @@ def train(model, optimizer, train_loader, args, device, emb=None):
             logits = model(data.z, data.edge_index, data.batch, x, edge_weight, node_id, data.src_degree,
                            data.dst_degree)
             loss = get_loss(args.loss)(logits, data.y)
-        if args.l1 > 0:
-            l1_reg = torch.tensor(0, dtype=torch.float)
-            lin_params = torch.cat([x.view(-1) for x in model.lin.parameters()])
-            for param in lin_params:
-                l1_reg += torch.norm(param, 1) ** 2
-            loss = loss + args.l1 * l1_reg
+        else:
+            node_features = model(emb.weight.to(device), data.edge_index.to(device))
+            curr_links = links[indices].to(device)
+            curr_labels = labels[indices].to(device)
+            curr_marks = marks[indices].to(device)
+            num_sample=0
+            if args.dblp and num_sample:
+                upsample_index = torch.randperm(mark1.size(0))[:num_sample]
+                upsample_links = mark1[upsample_index]
+                upsample_labels = mark1_label[upsample_index]
+                curr_links = torch.concat([curr_links,upsample_links], dim=0)
+                curr_labels = torch.concat([curr_labels, upsample_labels], dim=0)
+                curr_marks = torch.concat([curr_marks,torch.ones(num_sample).to(device)])
+            num_ipm = 128
+            batch_node_features = None if node_features is None else node_features[curr_links]
+            optimizer.zero_grad()
+            if args.dblp:
+                logits = model.predictor(batch_node_features, curr_marks)
+                pos_weight = (curr_labels.size(0)-curr_labels.sum())/curr_labels.sum()
+                loss = get_loss(args.loss)(logits, curr_labels.squeeze(0).to(device),pos_weight=pos_weight)
+                selected_t0_link = curr_links[curr_marks==0][:num_ipm]
+                current_t0_link = node_features[selected_t0_link]
+                current_t0_link_emb = current_t0_link[:, 0, :] * current_t0_link[:, 1, :]
+                selected_t1_links = mark1[torch.randperm(mark1.size(0))][:num_ipm]
+                t1_link = node_features[selected_t1_links]
+                current_t1_link_emb = t1_link[:, 0, :] * t1_link[:, 1, :]
+                # Calculate MMD
+                disc = mmd(current_t0_link_emb, current_t1_link_emb)    
+                loss = loss + 0.05 * disc   
+            else:
+                pos_weight = (curr_labels.size(0)-curr_labels.sum())/curr_labels.sum()
+                logits = model.predictor(batch_node_features)
+                loss = get_loss(args.loss)(logits, curr_labels.squeeze(0).to(device),pos_weight)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(emb.weight, 1.0)
+
         optimizer.step()
         total_loss += loss.item() * args.batch_size
-        del data
         torch.cuda.empty_cache()
         batch_processing_times.append(time.time() - start_time)
-        if (batch_count + 1) * args.batch_size > train_samples:
-            break
     if args.wandb:
         wandb.log({"train_batch_time": np.mean(batch_processing_times)})
         wandb.log({"train_epoch_time": time.time() - t0})
@@ -157,7 +202,27 @@ def train(model, optimizer, train_loader, args, device, emb=None):
     return total_loss / len(train_loader.dataset)
 
 
-def train_elph(model, optimizer, train_loader, args, device):
+def mmd(x, y, kernel_type='rbf', kernel_param=1.0):
+    # Compute pairwise squared Euclidean distances
+    xx = torch.cdist(x, x, p=2).pow(2)
+    yy = torch.cdist(y, y, p=2).pow(2)
+    xy = torch.cdist(x, y, p=2).pow(2)
+
+    # Compute kernel function
+    if kernel_type == 'rbf':
+        xx_kernel = torch.exp(-xx / (2 * kernel_param ** 2))
+        yy_kernel = torch.exp(-yy / (2 * kernel_param ** 2))
+        xy_kernel = torch.exp(-xy / (2 * kernel_param ** 2))
+    elif kernel_type == 'linear':
+        xx_kernel = xx
+        yy_kernel = yy 
+        xy_kernel = xy
+    else:
+        raise ValueError("Invalid kernel type. Supported types: 'rbf', 'linear'.")
+    mmd = xx_kernel.mean() + yy_kernel.mean() - 2 * xy_kernel.mean()
+    return mmd
+
+def train_elph(model, optimizer, train_loader, args, device,emb1=None):
     """
     train a GNN that calculates hashes using message passing
     @param model:
@@ -174,16 +239,19 @@ def train_elph(model, optimizer, train_loader, args, device):
     data = train_loader.dataset
     # hydrate edges
     links = data.links
+    mark1 = data.all_mark1.to(device)
+    mark1_label = data.all_mark1_label.to(device)
     labels = torch.tensor(data.labels)
     # sampling
     train_samples = get_num_samples(args.train_samples, len(labels))
     sample_indices = torch.randperm(len(labels))[:train_samples]
     links = links[sample_indices]
     labels = labels[sample_indices]
-
+    marks = data.marks[sample_indices]
     if args.wandb:
         wandb.log({"train_total_batches": len(train_loader)})
     batch_processing_times = []
+
     loader = DataLoader(range(len(links)), args.batch_size, shuffle=True)
     for batch_count, indices in enumerate(tqdm(loader)):
         # do node level things
@@ -196,7 +264,19 @@ def train_elph(model, optimizer, train_loader, args, device):
             emb = None
         # get node features
         node_features, hashes, cards = model(data.x.to(device), data.edge_index.to(device))
+        # print(node_features)
         curr_links = links[indices].to(device)
+        curr_labels = labels[indices].to(device)
+        curr_marks = marks[indices].to(device)
+        num_sample=0
+        if args.dblp and num_sample:
+            upsample_index = torch.randperm(mark1.size(0))[:num_sample]
+            upsample_links = mark1[upsample_index]
+            upsample_labels = mark1_label[upsample_index]
+            curr_links = torch.concat([curr_links,upsample_links], dim=0)
+            curr_labels = torch.concat([curr_labels, upsample_labels], dim=0)
+            curr_marks = torch.concat([curr_marks,torch.ones(num_sample).to(device)])
+        num_ipm = 128
         batch_node_features = None if node_features is None else node_features[curr_links]
         batch_emb = None if emb is None else emb[curr_links].to(device)
         # hydrate link features
@@ -206,10 +286,25 @@ def train_elph(model, optimizer, train_loader, args, device):
             subgraph_features = torch.zeros(data.subgraph_features[indices].shape).to(device)
         start_time = time.time()
         optimizer.zero_grad()
-        logits = model.predictor(subgraph_features, batch_node_features, batch_emb)
-        loss = get_loss(args.loss)(logits, labels[indices].squeeze(0).to(device))
-
+        table = emb if emb is not None else node_features
+        if args.dblp:
+            logits = model.predictor(subgraph_features,batch_node_features, batch_emb,curr_marks)
+            pos_weight = (curr_labels.size(0)-curr_labels.sum())/curr_labels.sum()
+            loss = get_loss(args.loss)(logits, curr_labels.squeeze(0).to(device),pos_weight=pos_weight)
+            selected_t0_link = curr_links[curr_marks==0][:num_ipm]
+            current_t0_link = table[selected_t0_link]
+            current_t0_link_emb = current_t0_link[:, 0, :] * current_t0_link[:, 1, :]
+            selected_t1_links = mark1[torch.randperm(mark1.size(0))][:num_ipm]
+            t1_link = table[selected_t1_links]
+            current_t1_link_emb = t1_link[:, 0, :] * t1_link[:, 1, :]
+            # Calculate MMD
+            disc = mmd(current_t0_link_emb, current_t1_link_emb)    
+            loss = loss + 0.01 * disc
+        else:
+            logits = model.predictor(subgraph_features, batch_node_features, batch_emb)
+            loss = get_loss(args.loss)(logits, curr_labels.squeeze(0).to(device))
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * args.batch_size
         batch_processing_times.append(time.time() - start_time)
@@ -241,8 +336,8 @@ def auc_loss(logits, y, num_neg=1):
     return torch.square(1 - (pos_out - neg_out)).sum()
 
 
-def bce_loss(logits, y, num_neg=1):
-    return BCEWithLogitsLoss()(logits.view(-1), y.to(torch.float))
+def bce_loss(logits, y, pos_weight=None):
+    return BCEWithLogitsLoss(pos_weight=pos_weight)(logits.view(-1), y.to(torch.float))
 
 
 def get_loss(loss_str):

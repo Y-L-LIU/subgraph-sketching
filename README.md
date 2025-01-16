@@ -68,18 +68,30 @@ cd subgraph-sketching/src
 conda activate ss
 python runners/run.py --dataset_name Cora --model ELPH
 python runners/run.py --dataset_name Cora --model BUDDY
+
+##cora best 84.8
+python runners/run.py --dataset_name Cora --model ELPH --num_negs 1 --hidden_channels 1024   --batch_size 512
+
 python runners/run.py --dataset_name Citeseer --model ELPH
 python runners/run.py --dataset_name Citeseer --model BUDDY
+
+##pubmed best 64.35
 python runners/run.py --dataset_name Pubmed --max_hash_hops 3 --feature_dropout 0.2 --model ELPH
 python runners/run.py --dataset_name Pubmed --max_hash_hops 3 --feature_dropout 0.2 --model BUDDY
-python runners/run.py --dataset_name ogbl-collab --K 50 --lr 0.01 --feature_dropout 0.05 --add_normed_features 1 --label_dropout 0.1 --batch_size 2048 --year 2007 --model ELPH
+
+python runners/run.py --dataset ogbl-ddi --K 20 --cache_subgraph_features --train_node_embedding --propagate_embeddings --label_dropout 0.25 --epochs 150 --hidden_channels 256 --lr 0.00015 --num_negs 1 --use_feature 0 --sign_k 2 --batch_size 131072 --device 3 --model SAGE --dblp
+
+
+python runners/run.py --dataset_name ogbl-collab --K 50 --lr 0.0005 --feature_dropout 0.05 --add_normed_features 1 --label_dropout 0.1 --batch_size 2048 --year 2007 --model ELPH --hidden_channels 256
+
 python runners/run.py --dataset_name ogbl-collab --K 50 --lr 0.02 --feature_dropout 0.05 --add_normed_features 1 --cache_subgraph_features --label_dropout 0.1 --year 2007 --model BUDDY
-python runners/run.py --dataset_name ogbl-ppa --label_dropout 0.1 --use_feature 0 --use_RA 1 --lr 0.03 --epochs 100 --hidden_channels 256 --cache_subgraph_features --add_normed_features 1 ----use_zero_one 1 model BUDDY
-python runners/run.py --dataset ogbl-ddi --K 20 --train_node_embedding --propagate_embeddings --label_dropout 0.25 --epochs 150 --hidden_channels 256 --lr 0.0015 --num_negs 6 --use_feature 0 --sign_k 2 --batch_size 131072 --model ELPH
+python runners/run.py --dataset_name ogbl-ppa --label_dropout 0.1 --use_feature 0 --use_RA 1 --lr 0.03 --epochs 100 --hidden_channels 256 --cache_subgraph_features --add_normed_features 1 --use_zero_one 1 --model BUDDY
+python runners/run.py --dataset ogbl-ddi --K 20 --cache_subgraph_features --train_node_embedding --propagate_embeddings --label_dropout 0.25 --epochs 150 --hidden_channels 256 --lr 0.0015 --num_negs 6 --use_feature 0 --sign_k 2 --batch_size 131072 --device 3 --model ELPH
 python runners/run.py --dataset ogbl-ddi --K 20 --train_node_embedding --propagate_embeddings --label_dropout 0.25 --epochs 150 --hidden_channels 256 --lr 0.0015 --num_negs 6 --use_feature 0 --sign_k 2 --cache_subgraph_features --batch_size 131072 --model BUDDY
 python runners/run.py --dataset ogbl-citation2 --hidden_channels 128 --num_negs 5 --lr 0.0005 --sign_dropout 0.2 --feature_dropout 0.7 --label_dropout 0.8 --sign_k 3 --batch_size 261424 --eval_batch_size 522848 --cache_subgraph_features --model BUDDY
 ```
 You may need to adjust 
+
 ```
 --batch_size 
 --num_workers

@@ -9,7 +9,7 @@ from math import inf
 import torch
 import numpy as np
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+ROOT_DIR = os.path.abspath('/data_sda')
 
 DEFAULT_DIC = {'sample_size': None, 'dataset_name': 'Cora', 'num_hops': 2, 'max_dist': 10, 'max_nodes_per_hop': 10,
                'data_appendix': None, 'val_pct': 0.1, 'test_pct': 0.2, 'train_sample': 1, 'dynamic_train': True,
@@ -62,19 +62,37 @@ def select_embedding(args, num_nodes, device):
         emb = None
     return emb
 
+def edge_marking(data):
+    # Get final node colors
+    node_colors = data.node_colors
+    
+    # For each edge, compare the colors of the connected nodes
+    edge_u = data.edge_label_index[0]
+    edge_v = data.edge_label_index[1]
+    edge_marks = (node_colors[edge_u] == node_colors[edge_v]).long()  # 1 if same, 0 otherwise
+    
+    data.edge_marks = edge_marks
+    return data
 
-def get_pos_neg_edges(data, sample_frac=1):
+
+def get_pos_neg_edges(data, sample_frac=1, color=None):
     """
     extract the positive and negative supervision edges (as opposed to message passing edges) from data that has been
      transformed by RandomLinkSplit
     :param data: A train, val or test split returned by RandomLinkSplit
     :return: positive edge_index, negative edge_index.
     """
+    data.node_colors = color
+    data = edge_marking(data)
+    print(f'There are {data.edge_marks.sum()} edges mark=1')
     device = data.edge_index.device
     edge_index = data['edge_label_index'].to(device)
     labels = data['edge_label'].to(device)
+    marks = data['edge_marks'].to(device)
     pos_edges = edge_index[:, labels == 1].t()
+    pos_marks = marks[labels == 1]
     neg_edges = edge_index[:, labels == 0].t()
+    neg_marks = marks[labels == 0]
     if sample_frac != 1:
         n_pos = pos_edges.shape[0]
         np.random.seed(123)
@@ -82,7 +100,7 @@ def get_pos_neg_edges(data, sample_frac=1):
         perm = perm[:int(sample_frac * n_pos)]
         pos_edges = pos_edges[perm, :]
         neg_edges = neg_edges[perm, :]
-    return pos_edges.to(device), neg_edges.to(device)
+    return (pos_edges.to(device), pos_marks), (neg_edges.to(device), neg_marks)
 
 
 def get_same_source_negs(num_nodes, num_negs_per_pos, pos_edge):

@@ -21,15 +21,47 @@ import scipy.sparse as ssp
 
 from src.utils import get_src_dst_degree, neighbors, get_pos_neg_edges
 from src.labelling_tricks import drnl_node_labeling, de_node_labeling, de_plus_node_labeling
+from torch_scatter import scatter
+
+
+def wl_node_coloring(data, max_iters=10):
+    # Calculate node degrees
+    edge_index = data.edge_label_index[:,data.edge_label==1]
+    num_nodes = data.num_nodes
+    node_degrees = scatter(torch.ones_like(edge_index[0]), edge_index[1], dim=0, dim_size=num_nodes, reduce='sum')
+    
+    # Initialize colors with node degrees
+    node_colors = node_degrees.clone()
+
+    for _ in range(max_iters):
+        # Aggregate colors of neighbors
+        aggregated_colors = scatter(node_colors[edge_index[0]], edge_index[1], dim_size=num_nodes, reduce='mean')
+        
+        # Concatenate current colors with aggregated neighbor colors
+        new_colors = torch.stack([node_colors, aggregated_colors], dim=-1)
+        
+        # Apply a simple hash function: generate unique integers from concatenated values
+        new_colors = torch.sum(new_colors * torch.tensor([1000, 1], device=data.x.device), dim=-1)
+        
+        # Check for convergence
+        if torch.equal(node_colors, new_colors):
+            break
+        node_colors = new_colors
+    return node_colors
+
 
 
 class SEALDataset(InMemoryDataset):
     def __init__(self, root, data, pos_edges, neg_edges, num_hops, percent=1., split='train',
                  use_coalesce=False, node_label='drnl', ratio_per_hop=1.0,
-                 max_nodes_per_hop=None, max_dist=1000, directed=False, sign=False, k=None):
+                 max_nodes_per_hop=None, max_dist=1000, all_mark1=None,all_mark1_label=None,directed=False, sign=False, k=None):
         self.data = data
         self.pos_edges = pos_edges
         self.neg_edges = neg_edges
+        self.marks = torch.cat([pos_edges[1],neg_edges[1]])
+        self.all_mark1 = all_mark1 if all_mark1 is not None else None
+        self.all_mark1_label = all_mark1_label if all_mark1_label is not None else None
+
         self.num_hops = num_hops
         self.percent = int(percent) if percent >= 1.0 else percent
         self.split = split
@@ -155,7 +187,7 @@ def sample_data(data, sample_arg):
         samples = len(data)
     if samples != inf:
         sample_indices = torch.randperm(len(data))[:samples]
-    return data[sample_indices]
+    return data[0][sample_indices], data[1][sample_indices]
 
 
 def get_train_val_test_datasets(dataset, train_data, val_data, test_data, args):
@@ -167,9 +199,15 @@ def get_train_val_test_datasets(dataset, train_data, val_data, test_data, args):
     train_percent, val_percent, test_percent = 1 - (args.val_pct + args.test_pct), args.val_pct, args.test_pct
     # probably should be an attribute of the dataset and not hardcoded
     directed = False
-    pos_train_edge, neg_train_edge = get_pos_neg_edges(train_data)
-    pos_val_edge, neg_val_edge = get_pos_neg_edges(val_data)
-    pos_test_edge, neg_test_edge = get_pos_neg_edges(test_data)
+    colors = wl_node_coloring(train_data)
+    pos_train_edge, neg_train_edge = get_pos_neg_edges(train_data,color=colors)
+    pos_val_edge, neg_val_edge = get_pos_neg_edges(val_data,color=colors)
+    pos_test_edge, neg_test_edge = get_pos_neg_edges(test_data,color=colors)
+    edges = train_data['edge_label_index'].to(train_data['edge_index'].device)
+    labels = train_data['edge_label'].to(train_data['edge_index'].device)
+    all_mark1 = edges[:,train_data['edge_marks']==1].t()
+    all_mark1_label = labels[train_data['edge_marks']==1]
+
     print(
         f'before sampling, considering a superset of {pos_train_edge.shape[0]} pos, {neg_train_edge.shape[0]} neg train edges '
         f'{pos_val_edge.shape[0]} pos, {neg_val_edge.shape[0]} neg val edges '
@@ -201,6 +239,7 @@ def get_train_val_test_datasets(dataset, train_data, val_data, test_data, args):
         ratio_per_hop=args.ratio_per_hop,
         max_nodes_per_hop=args.max_nodes_per_hop,
         max_dist=args.max_dist,
+
         directed=directed,
         sign=args.model == 'sign',
         k=args.sign_k

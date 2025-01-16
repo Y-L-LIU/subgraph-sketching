@@ -13,20 +13,61 @@ from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.typing import Adj, OptTensor
 from torch_geometric.nn.inits import zeros
 import torch_sparse
+from torch import nn
+
+class Decoder(nn.Module):
+    def __init__(self, dim_z, dim_sf, cuda, dim_h=64):
+        super(Decoder, self).__init__()
+        dim_in = dim_z
+        self.mlp_embed = nn.Sequential(
+            nn.Linear(dim_in, dim_in, bias=True),
+            nn.BatchNorm1d(dim_in),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+        )
+        concat_dim = dim_in
+        self.out_1 = nn.Sequential(nn.Linear(concat_dim, 1, bias=False), nn.Sigmoid())
+        self.out_0 = nn.Sequential(nn.Linear(concat_dim, 1, bias=False), nn.Sigmoid())
+        self.lin = Linear(concat_dim, 1)
+
+
+    def forward(self, z, T):
+        # z is the subgraph feature
+        z = z[:, 0, :] * z[:, 1, :]
+        z = self.mlp_embed(z)
+        h0 = z
+        h_1 = self.out_1(h0).squeeze()  # (N,)
+        h_0 = self.out_0(h0).squeeze()
+        t1 = T.squeeze().float()
+        res_f = torch.zeros_like(t1).to(T.device)
+        # return self.lin(h0)
+        res_f[t1 == 0] = h_0[t1 == 0]
+        res_f[t1 == 1] = h_1[t1 == 1]
+        h = res_f
+        return h
+
+    def reset_parameters(self):
+        for lin in self.mlp_out:
+            try:
+                lin.reset_parameters()
+            except:
+                continue
 
 
 class GCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
-                 dropout):
+    def __init__(self, args, num_feature, num_layers,dropout=0.3):
         super(GCN, self).__init__()
-
         self.convs = torch.nn.ModuleList()
-        self.convs.append(GCNConv(in_channels, hidden_channels, cached=True))
+        dim_h = args.hidden_channels
+        self.convs.append(GCNConv(num_feature, dim_h, cached=True))
         for _ in range(num_layers - 2):
             self.convs.append(
-                GCNConv(hidden_channels, hidden_channels, cached=True))
-        self.convs.append(GCNConv(hidden_channels, out_channels, cached=True))
-
+                GCNConv(dim_h, dim_h, cached=True))
+        self.convs.append(GCNConv(dim_h, dim_h, cached=True))
+        if args.dblp:
+            self.predictor = Decoder(args.hidden_channels, args.max_hash_hops * (args.max_hash_hops + 2),'cuda:0')
+        else:
+            self.predictor = LinkPredictor(dim_h,dim_h,1,2,0.3)
         self.dropout = dropout
 
     def reset_parameters(self):
@@ -88,15 +129,19 @@ class GCNCustomConv(torch.nn.Module):
 
 
 class SAGE(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
-                 dropout, residual):
+    def __init__(self, args, num_feature, num_layers,
+                 dropout=0.3, residual=True):
         super(SAGE, self).__init__()
-
+        dim_h = args.hidden_channels
         self.convs = torch.nn.ModuleList()
-        self.convs.append(SAGEConv(in_channels, hidden_channels, root_weight=residual))
+        self.convs.append(SAGEConv(num_feature, dim_h, root_weight=residual))
         for _ in range(num_layers - 2):
-            self.convs.append(SAGEConv(hidden_channels, hidden_channels, root_weight=residual))
-        self.convs.append(SAGEConv(hidden_channels, out_channels, root_weight=residual))
+            self.convs.append(SAGEConv(dim_h, dim_h, root_weight=residual))
+        self.convs.append(SAGEConv(dim_h, dim_h, root_weight=residual))
+        if args.dblp:
+            self.predictor = Decoder(args.hidden_channels, args.max_hash_hops * (args.max_hash_hops + 2),'cuda:0')
+        else:
+            self.predictor = LinkPredictor(dim_h,dim_h,1,2,0.3)
 
         self.dropout = dropout
 
@@ -195,7 +240,6 @@ class LinkPredictor(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
                  dropout):
         super(LinkPredictor, self).__init__()
-
         self.lins = torch.nn.ModuleList()
         self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
         for _ in range(num_layers - 2):
@@ -208,8 +252,9 @@ class LinkPredictor(torch.nn.Module):
         for lin in self.lins:
             lin.reset_parameters()
 
-    def forward(self, x_i, x_j):
-        x = x_i * x_j
+    def forward(self, z):
+        x = z[:, 0, :] * z[:, 1, :]
+
         for lin in self.lins[:-1]:
             x = lin(x)
             x = F.relu(x)
